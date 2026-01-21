@@ -21,7 +21,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2"],),
+                "model_type": (["flux2","z-image","chroma"],),
             }
         }
 
@@ -49,6 +49,17 @@ class UNetLoaderINTW8A8:
                 'img_in', 'time_in', 'guidance_in', 'txt_in', 'final_layer', 
                 'double_stream_modulation_img', 'double_stream_modulation_txt', 
                 'single_stream_modulation'
+            ]
+        elif model_type == "z-image":
+            Int8TensorwiseOps.excluded_names = [
+                'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner', 
+                'final_layer', 'noise_refiner', 
+                'x_pad_token'
+            ]
+        elif model_type == "chroma":
+            Int8TensorwiseOps.excluded_names = [
+                'distilled_guidance_layer', 'final_layer', 'img_in', 'txt_in' 'nerf_image_embedder',
+                 'nerf_blocks', 'nerf_final_layer_conv'
             ]
             #print(f"Applying Flux2-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
