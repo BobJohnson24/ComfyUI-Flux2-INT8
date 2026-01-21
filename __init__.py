@@ -1,72 +1,58 @@
-"""
-int88 - Fast INT8 Tensorwise Quantization for ComfyUI
+# --- FILE: __init__.py ---
+import logging
+import torch
 
-Provides:
-- Int8TensorwiseOps: Custom operations for direct int8 weight loading
-- OTUNetLoaderW8A8: Load int8 quantized diffusion models
-- OTCheckpointLoaderW8A8: Load int8 quantized checkpoints
-
-Uses torch._int_mm for blazing fast inference.
-"""
-
-# Register the int8_tensorwise format with ComfyUI's quant registry
-# This is for metadata compatibility when saving/loading models
+# 1. Setup Internal Imports (Lazy loading prevents circular imports)
 try:
-    from comfy.quant_ops import QUANT_ALGOS, register_layout_class, QuantizedLayout
-    import torch
+    from .int8_unet_loader import UNetLoaderINTW8A8
+    # If you have custom ops exposed for external use
+    from .int8_quant import Int8TensorwiseOps 
+except ImportError:
+    UNetLoaderINTW8A8 = None
+    Int8TensorwiseOps = None
+    pass
 
-    class Int8TensorwiseLayout(QuantizedLayout):
-        """Minimal layout class to satisfy ComfyUI's registry requirements."""
-        class Params:
-            def __init__(self, scale=None, orig_dtype=None, orig_shape=None, **kwargs):
-                self.scale = scale
-                self.orig_dtype = orig_dtype
-                self.orig_shape = orig_shape
-            
-            def clone(self):
-                import torch
-                return Int8TensorwiseLayout.Params(
-                    scale=self.scale.clone() if isinstance(self.scale, torch.Tensor) else self.scale,
-                    orig_dtype=self.orig_dtype,
-                    orig_shape=self.orig_shape
-                )
+# 2. Register Layouts (The "Proper" way)
+def _register_layouts():
+    try:
+        from comfy.quant_ops import QUANT_ALGOS, register_layout_class
+        # Import the class from our separate file
+        from .layouts import Int8TensorwiseLayout
 
-        @classmethod
-        def state_dict_tensors(cls, qdata, params):
-            return {"": qdata, "weight_scale": params.scale}
-        
-        @classmethod  
-        def dequantize(cls, qdata, params):
-            return qdata.float() * params.scale
+        # Register the class string
+        register_layout_class("Int8TensorwiseLayout", Int8TensorwiseLayout)
 
-    register_layout_class("Int8TensorwiseLayout", Int8TensorwiseLayout)
-
-    cur_config = QUANT_ALGOS.get("int8_tensorwise")
-    if cur_config is None:
-        QUANT_ALGOS["int8_tensorwise"] = {
+        # Update QUANT_ALGOS
+        # This tells ComfyUI: "When you see 'int8_tensorwise', use this layout"
+        algo_config = {
             "storage_t": torch.int8,
             "parameters": {"weight_scale", "input_scale"},
             "comfy_tensor_layout": "Int8TensorwiseLayout",
         }
-    else:
-        cur_config["comfy_tensor_layout"] = "Int8TensorwiseLayout"
-        cur_config["parameters"] = {"weight_scale", "input_scale"}
+        
+        # Use setdefault to play nice with other nodes
+        QUANT_ALGOS.setdefault("int8_tensorwise", algo_config)
+        
+        # Update existing if needed (in case ComfyUI loaded a default stub)
+        if QUANT_ALGOS["int8_tensorwise"].get("comfy_tensor_layout") != "Int8TensorwiseLayout":
+            QUANT_ALGOS["int8_tensorwise"].update(algo_config)
 
-except ImportError:
-    pass
+        logging.info("Int8-Quant: Registered Int8TensorwiseLayout successfully.")
 
-# Export the custom ops class for external use
-try:
-    from .int8_quant import Int8TensorwiseOps
-except ImportError:
-    Int8TensorwiseOps = None
+    except ImportError:
+        logging.warning("Int8-Quant: Failed to register layout. ComfyUI too old?")
+    except Exception as e:
+        logging.error(f"Int8-Quant: Error registering layout: {e}")
 
-from .int8_unet_loader import UNetLoaderINTW8A8
+# Run registration immediately
+_register_layouts()
 
-NODE_CLASS_MAPPINGS = {
-    "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
-}
+# 3. Export Node Mappings
+NODE_CLASS_MAPPINGS = {}
+NODE_DISPLAY_NAME_MAPPINGS = {}
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
-}
+if UNetLoaderINTW8A8:
+    NODE_CLASS_MAPPINGS["OTUNetLoaderW8A8"] = UNetLoaderINTW8A8
+    NODE_DISPLAY_NAME_MAPPINGS["OTUNetLoaderW8A8"] = "Load Diffusion Model INT8 (W8A8)"
+
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
