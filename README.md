@@ -16,7 +16,10 @@ Works with lora*, torch compile (needed to get full speedup).
 - Requires the node from [KohakuBlueleaf's PR #11958](https://github.com/Comfy-Org/ComfyUI/pull/11958)
 
 We auto-convert flux2 klein to INT8 on load if needed. Pre-quantized checkpoints with slightly higher quality and enabling faster loading are available here: 
+
 https://huggingface.co/bertbobson/FLUX.2-klein-9B-INT8-Comfy
+
+https://huggingface.co/bertbobson/Chroma1-HD-INT8Tensorwise
 
 # Metrics:
 
