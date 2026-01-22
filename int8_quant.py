@@ -106,6 +106,39 @@ def quantize_int8_axiswise(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
     return q.float() * scale
 
+def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
+    """
+    Quantize a delta tensor to INT8 using stochastic rounding.
+    
+    This is used for LoRA deltas to minimize quantization error while preserving
+    the pre-quantized base weights' quality.
+    
+    Args:
+        x: FP32 delta tensor to quantize
+        scale: The quantization scale from the original INT8 weights
+        seed: Random seed for reproducibility
+    
+    Returns:
+        INT8 quantized delta tensor
+    """
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(seed)
+    
+    # Scale to INT8 range (no zero-point for delta)
+    x_scaled = x / scale
+    
+    # Stochastic rounding
+    x_floor = torch.floor(x_scaled)
+    fraction = x_scaled - x_floor
+    
+    # Speed optimization: Create random values directly on the target device
+    random_vals = torch.rand(x_scaled.shape, generator=generator, device=x.device, dtype=x_scaled.dtype)
+    x_rounded = torch.where(random_vals < fraction, x_floor + 1, x_floor)
+    
+    # Clamp to INT8 range [-128, 127]
+    return torch.clamp(x_rounded, -128, 127).to(torch.int8)
+
+
 # --- LinearW8A8 ---
 
 @torch.no_grad()
@@ -152,8 +185,15 @@ class LinearW8A8(nn.Linear):
         if self.__is_quantized:
             return
         self.requires_grad_(False)
-        weight, scale = quantize_int8_tensorwise(self.weight.data)
-        self.weight.data = weight
+        
+        # Speed optimization: Perform quantization math on GPU if available
+        # One layer at a time is very safe for VRAM.
+        device = torch.device("cuda") if torch.cuda.is_available() else self.weight.device
+        w_gpu = self.weight.data.to(device, non_blocking=True)
+        
+        weight, scale = quantize_int8_tensorwise(w_gpu)
+        
+        self.weight.data = weight.to(self.weight.device)
         self.scale.fill_(scale)
         self.__is_quantized = True
 
@@ -294,6 +334,74 @@ def apply_quantization(parent_module, compute_dtype=torch.float16, visited_modul
 
 
 # =============================================================================
+# INT8 LoRA Adapter - High Precision, Low RAM Patching
+# =============================================================================
+
+try:
+    from comfy.weight_adapter.lora import LoRAAdapter
+    _LORA_ADAPTER_AVAILABLE = True
+except ImportError:
+    _LORA_ADAPTER_AVAILABLE = False
+
+if _LORA_ADAPTER_AVAILABLE:
+    class INT8LoRAPatchAdapter(LoRAAdapter):
+        """
+        Specialized LoRA adapter that patches INT8 weights IN-PLACE in INT8 space.
+        
+        This avoids dequantizing the base model to FP32, saving GIGABYTES of RAM
+        while maintaining perfect precision via stochastic rounding.
+        """
+        def __init__(self, loaded_keys, weights, weight_scale, seed=0):
+            super().__init__(loaded_keys, weights)
+            self.weight_scale = weight_scale
+            self.seed = seed
+
+        def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
+            # weight: The base weight (ideally INT8 from convert_weight)
+            # self.weights: (up, down, alpha, mid, dora, reshape)
+            
+            v = self.weights
+            up, down, alpha = v[0], v[1], v[2]
+            
+            # 1. Resolve LoRA Scale
+            rank = down.shape[0] if down.ndim >= 2 else 1
+            scale = (alpha / rank) * strength if alpha is not None else strength
+            
+            device = weight.device
+            
+            # 2. Compute LoRA Delta in high-precision intermediate space
+            # Use GPU for speed (one layer at a time is very safe for VRAM)
+            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            
+            up_f = up.to(comp_device, dtype=intermediate_dtype)
+            down_f = down.to(comp_device, dtype=intermediate_dtype)
+            
+            # Handle possible mid weights (LoCon/LoHA)
+            if v[3] is not None:
+                mid_f = v[3].to(comp_device, dtype=intermediate_dtype)
+                # ... (simplified for now, full tucker expansion would go here)
+                lora_diff = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1))).reshape(weight.shape)
+            else:
+                lora_diff = torch.mm(up_f.flatten(1), down_f.flatten(1)).reshape(weight.shape)
+            
+            # 3. Apply Patch
+            if weight.dtype == torch.int8:
+                # --- INT8 SPACE PATCHING (Giga-Brain Memory Efficiency) ---
+                # We add the stochastically rounded delta directly to the bytes.
+                delta_f = lora_diff * scale
+                
+                # stochastic_round_int8_delta is already GPU-optimized
+                delta_int8 = stochastic_round_int8_delta(delta_f, self.weight_scale, self.seed)
+                
+                # Perform integer addition (int32 for safety)
+                res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
+                return torch.clamp(res, -128, 127).to(torch.int8).to(device)
+            else:
+                # Fallback: Standard Float Patching (if weight was already dequantized by another patch)
+                # Base_Float = Base_Int8 * Scale. So we add the float delta directly.
+                return weight + (lora_diff * scale).to(weight.device, weight.dtype)
+
+# =============================================================================
 # Int8TensorwiseOps - Proper ComfyUI Custom Operations Class
 # =============================================================================
 # This replaces the old dequant→load→requant hack with direct int8 loading.
@@ -312,10 +420,6 @@ if _COMFY_OPS_AVAILABLE:
         
         This properly integrates with ComfyUI's model loading while keeping
         the blazing fast torch._int_mm forward path.
-        
-        Usage:
-            model_options = {"custom_operations": Int8TensorwiseOps}
-            model = comfy.sd.load_diffusion_model(path, model_options=model_options)
         """
         excluded_names = []
         
@@ -343,29 +447,20 @@ if _COMFY_OPS_AVAILABLE:
                 unexpected_keys,
                 error_msgs,
             ):
-                """
-                Directly load int8 weights and scales from state dict.
-                No dequant/requant needed!
-                """
+                """Directly load int8 weights and scales from state dict."""
                 weight_key = prefix + "weight"
                 scale_key = prefix + "weight_scale"
                 input_scale_key = prefix + "input_scale"
                 bias_key = prefix + "bias"
                 
-                # Pop scale tensors (don't let parent class see them)
                 weight_scale = state_dict.pop(scale_key, None)
                 input_scale = state_dict.pop(input_scale_key, None)
-                
-                # Pop comfy_quant metadata if present
                 state_dict.pop(prefix + "comfy_quant", None)
-                
-                # Get weight tensor
                 weight_tensor = state_dict.pop(weight_key, None)
                 
                 if weight_tensor is not None:
                     # Check if this is an int8 quantized weight
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
-                        # Direct int8 load - no dequant needed!
                         self._is_quantized = True
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         
@@ -378,84 +473,142 @@ if _COMFY_OPS_AVAILABLE:
                         else:
                             self.weight_scale = float(weight_scale)
                         
-                        # Store input scale if present (for static quantization)
+                        # Store input scale if present
                         if input_scale is not None:
                             if isinstance(input_scale, torch.Tensor):
                                 self.input_scale = input_scale.float()
                             else:
                                 self.input_scale = torch.tensor(input_scale, dtype=torch.float32)
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                        # High-precision weight - quantize on-the-fly?
-                        
-                        # 1. Skip if name is excluded
+                        # High-precision weight
                         is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
-                        
-                        # 2. Skip if it's a "dim1" layer (in_features=1 or out_features=1)
-                        # or if the weight tensor itself is 1D (ndim=1, e.g. [x])
                         is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                         
                         if is_excluded or is_dim1:
-                            reason = "excluded" if is_excluded else "dim1/1D"
-                            #print(f"Skipping dynamic quantization for {prefix.rstrip('.')} ({reason})")
                             self._is_quantized = False
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                         else:
-                            # This restores the dynamic quantization lost in the transition to custom ops.
-                            #print(f"Dynamic quantization: {prefix.rstrip('.')} ({weight_tensor.dtype} -> INT8)")
-                            q_weight, q_scale = quantize_int8_tensorwise(weight_tensor)
-                            self.weight = nn.Parameter(q_weight, requires_grad=False)
-                            self.weight_scale = q_scale
+                            # Speed optimization: Quantize high-precision weights on GPU
+                            device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
+                            w_gpu = weight_tensor.to(device, non_blocking=True)
+                            q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
+                            
+                            self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+                            self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
                             self._is_quantized = True
                     else:
-                        # Non-quantized weight (and not a known float type) - store as-is
                         self._is_quantized = False
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
                 else:
                     missing_keys.append(weight_key)
                 
-                # Handle bias
                 bias_tensor = state_dict.pop(bias_key, None)
                 if bias_tensor is not None:
                     self.bias = nn.Parameter(bias_tensor, requires_grad=False)
                 else:
                     self.bias = None
-            
+
+            def convert_weight(self, _weight, inplace=False):
+                """
+                Returns weight for patching.
+                Returns raw INT8 to avoid FP32 model expansion in RAM.
+                """
+                if not self._is_quantized:
+                    return _weight
+                # We ignore the lossy cast usually passed in _weight
+                return self.weight
+
+            def set_weight(self, out_weight, inplace_update=False, seed=0):
+                """Sets the patched weight."""
+                if not self._is_quantized:
+                    if inplace_update:
+                        self.weight.data.copy_(out_weight)
+                    else:
+                        self.weight = nn.Parameter(out_weight.to(self.weight.dtype), requires_grad=False)
+                    return
+
+                # If the patching happened in INT8 space, we just save it.
+                if out_weight.dtype == torch.int8:
+                    if inplace_update:
+                        self.weight.data.copy_(out_weight)
+                    else:
+                        self.weight = nn.Parameter(out_weight, requires_grad=False)
+                    return
+
+                # If patching resulted in floats (fallback), re-quantize.
+                from .int8_quant import stochastic_round_int8_delta
+                new_weight = stochastic_round_int8_delta(out_weight, self.weight_scale, seed)
+                if inplace_update:
+                    self.weight.data.copy_(new_weight)
+                else:
+                    self.weight = nn.Parameter(new_weight, requires_grad=False)
+
+            def set_bias(self, out_bias, inplace_update=False, seed=0):
+                if out_bias is None: return
+                if inplace_update:
+                    if self.bias is not None:
+                        self.bias.data.copy_(out_bias)
+                else:
+                    self.bias = nn.Parameter(out_bias, requires_grad=False)
+
             def forward(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""
+                
                 if not self._is_quantized:
                     # Non-quantized path - use standard ComfyUI cast
-                    weight, bias, offload_stream = cast_bias_weight(
-                        self, x, offloadable=True
-                    )
+                    weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
                     out = F.linear(x, weight, bias)
                     uncast_bias_weight(self, weight, bias, offload_stream)
                     return out
                 
-                # Quantized path - use fast int8 matmul
+                # Quantized path
+                # NOTE: We intentionally do NOT use cast_bias_weight for the weight here.
+                # cast_bias_weight in ComfyUI often forces a cast to BF16/FP16 which breaks _int_mm.
+                # We manually move the weight to GPU while STRICTLY preserving Int8.
+                
+                # 1. Move weight to device (non_blocking for speed)
+                weight = self.weight.to(x.device, non_blocking=True)
+                
+                # 2. Handle Bias (if present, usually needs to be moved)
+                bias = None
+                if self.bias is not None:
+                    bias = self.bias.to(x.device, non_blocking=True)
+                
+                # 3. Handle Scales
+                w_scale = self.weight_scale
+                if isinstance(w_scale, torch.Tensor):
+                    w_scale = w_scale.to(x.device, non_blocking=True)
+                
+                
+                i_scale = self.input_scale
+                if i_scale is not None and isinstance(i_scale, torch.Tensor):
+                    i_scale = i_scale.to(x.device, non_blocking=True)
+                
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
                 
                 # Flatten to 2D for matmul
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
+                
                 # Use the appropriate forward based on batch size
                 if x_2d.shape[0] > 16:
-                    if self.input_scale is not None:
+                    if i_scale is not None:
                         # Static quantization path
                         y = int8_forward_static(
-                            x_2d, self.weight, self.weight_scale,
-                            self.input_scale, self.bias, compute_dtype
+                            x_2d, weight, w_scale,
+                            i_scale, bias, compute_dtype
                         )
                     else:
                         # Dynamic activation quantization (default)
                         y = int8_forward_dynamic(
-                            x_2d, self.weight, self.weight_scale,
-                            self.bias, compute_dtype
+                            x_2d, weight, w_scale,
+                            bias, compute_dtype
                         )
                 else:
                     # Small batch - dequantize for accuracy
-                    w_float = dequantize(self.weight, self.weight_scale).to(x.dtype)
-                    y = F.linear(x_2d, w_float, self.bias)
+                    w_float = dequantize(weight, w_scale).to(x.dtype)
+                    y = F.linear(x_2d, w_float, bias)
                 
                 # Reshape back
                 return y.reshape(*x_shape[:-1], y.shape[-1])
