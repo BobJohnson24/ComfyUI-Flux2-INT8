@@ -2,6 +2,14 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+# Add this at the top of your file
+try:
+    from .int8_fused_kernel import triton_int8_linear
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+    print("Triton not found, falling back to torch._int_mm")
+
 # --- Quantization Utils ---
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
@@ -47,13 +55,20 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
 @torch.no_grad()
 def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
+    
+    # --- FAST PATH: Triton Fused Kernel ---
+    if _TRITON_AVAILABLE and x.is_cuda:
+        return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
+
+    # --- SLOW PATH: Standard PyTorch ---
     # Quantize activations per row (dynamic)
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
     
-    # INT8 Matmul
+    # INT8 Matmul (Outputs Int32)
     res = torch._int_mm(x_8, weight.T)
     
     # Dequantize: (res * weight_scale * x_scale)
+    # Note: Creating intermediate Float tensors here is VRAM heavy
     res_scaled = res.float().mul_(weight_scale * x_scale).to(compute_dtype)
     
     if bias is not None:
