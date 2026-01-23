@@ -10,7 +10,11 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Quality:** Possibly slightly lower quality
 - Use the included INT8 LoRA node
 
-### Option 2: KohakuBlueleaf's Node
+### Option 2A: Included Int8 Dynamic LoRa Node
+- **Performance:** ~1.15x slower due to dynamic calculations
+- **Quality:** Possibly slightly higher quality
+
+### Option 2B: KohakuBlueleaf's Node
 - **Performance:** ~1.15x slower due to dynamic calculations
 - **Quality:** Possibly slightly higher quality
 - Requires the node from [KohakuBlueleaf's PR #11958](https://github.com/Comfy-Org/ComfyUI/pull/11958)
