@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 # =============================================================================
 # Kernel 1: Fused Row-wise Quantization (FP16/BF16 -> INT8 + Scale)
@@ -44,7 +45,7 @@ def _quantize_rowwise_kernel(
     
     # Round and Clamp
     # FIX: Use floor(x + 0.5) for rounding. This is portable across Triton versions.
-    q_i = tl.math.floor(q_f + 0.5)
+    q_i = libdevice.rint(q_f).to(tl.int32)
     q_i = tl.clamp(q_i, -128.0, 127.0)
     
     # 4. Store
@@ -65,7 +66,7 @@ def triton_quantize_rowwise(x: torch.Tensor):
     if BLOCK_SIZE < 128: BLOCK_SIZE = 128
     
     # Note: If cols > BLOCK_SIZE (e.g. > 8192 usually), this naive block logic needs a loop.
-    # For standard SDXL/Flux layers (dim 2048/4096), this is fine.
+    # For Flux2 Klein, Z-Image, Chroma layers this appears fine afaik.
     
     grid = (rows,)
     _quantize_rowwise_kernel[grid](x, y, s, cols, BLOCK_SIZE=BLOCK_SIZE)
