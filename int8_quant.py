@@ -75,159 +75,7 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
         res_scaled = res_scaled + bias.to(compute_dtype)
     return res_scaled
 
-class LinearW8A8(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
-        super().__init__(in_features, out_features, bias, device, dtype)
-        self.register_buffer("scale", torch.tensor(1.0, dtype=torch.float32))
-        self.__is_quantized = False
-        self.compute_dtype = torch.float16 # Default
-        self.lora_A = None
-        self.lora_B = None
-        self.lora_alpha = None
 
-    @torch.no_grad()
-    def quantize(self):
-        if self.__is_quantized:
-            return
-        self.requires_grad_(False)
-        
-        device = torch.device("cuda") if torch.cuda.is_available() else self.weight.device
-        w_gpu = self.weight.data.to(device, non_blocking=True)
-        
-        weight, scale = quantize_int8_tensorwise(w_gpu)
-        
-        self.weight.data = weight.to(self.weight.device)
-        self.scale.fill_(scale)
-        self.__is_quantized = True
-
-    @torch.no_grad()
-    def load_quantized(self, weight, weight_scale, input_scale=None):
-        """
-        Load pre-quantized weights. 
-        input_scale is accepted for compatibility but ignored.
-        """
-        self.requires_grad_(False)
-        self.weight.data = weight.to(self.weight.device)
-        self.scale.fill_(weight_scale)
-        # input_scale is ignored; we strictly use dynamic quantization
-        self.__is_quantized = True
-
-    def forward(self, x_orig: Tensor) -> Tensor:
-        if not self.__is_quantized:
-            return super().forward(x_orig)
-        
-        x = x_orig.reshape(-1, x_orig.shape[-1])
-        
-        # 1. Base INT8/Dequantized Linear
-        if x.shape[0] > 16:
-            y = int8_forward_dynamic(x, self.weight, self.scale, self.bias, self.compute_dtype)
-        else:
-            w = dequantize(self.weight, self.scale).to(x.dtype)
-            y = F.linear(x, w, self.bias)
-        
-        # 2. Add LoRA Path
-        if self.lora_A is not None and self.lora_B is not None:
-            # lora_A: [rank, in_features], lora_B: [out_features, rank]
-            # y = y + (x @ A.T @ B.T) * scale
-            # Note: We keep LoRA in high precision (compute_dtype or x.dtype)
-            lora_x = F.linear(x.to(self.lora_A.dtype), self.lora_A)
-            lora_y = F.linear(lora_x, self.lora_B)
-            
-            if self.lora_alpha is not None:
-                lora_y = lora_y * self.lora_alpha
-                
-            y = y + lora_y.to(y.dtype)
-        
-        return y.reshape(x_orig.shape[:-1] + (y.shape[-1],))
-
-def apply_quantization(parent_module, compute_dtype=torch.float16, visited_modules=None, exclude_names=None, prefix="", state_dict=None):
-    if visited_modules is None:
-        visited_modules = set()
-        apply_quantization._stats = {"loaded_learned": 0, "quantized_on_fly": 0}
-    if exclude_names is None:
-        exclude_names = []
-    
-    if id(parent_module) in visited_modules:
-        return parent_module
-    visited_modules.add(id(parent_module))
-
-    def should_exclude(name):
-        return any(ex in name for ex in exclude_names)
-
-    def replace_linear(module, full_name, parent, key):
-        if should_exclude(full_name):
-            return False
-        
-        new_module = LinearW8A8(module.in_features, module.out_features, module.bias is not None)
-        
-        # Check for pre-quantized weights in state_dict
-        loaded_quant = False
-        if state_dict is not None:
-            weight_key = f"{full_name}.weight"
-            scale_key = f"{full_name}.weight_scale"
-            
-            if weight_key in state_dict and scale_key in state_dict:
-                try:
-                    w_quant = state_dict[weight_key]
-                    s_quant = state_dict[scale_key]
-                    
-                    if w_quant.dtype == torch.int8:
-                        # Handle tensor scale - extract scalar if needed
-                        if isinstance(s_quant, torch.Tensor):
-                            if s_quant.numel() == 1:
-                                scale_val = s_quant.item()
-                            else:
-                                print(f"Warning: {full_name} has non-scalar weight_scale, re-quantizing")
-                                scale_val = None
-                        else:
-                            scale_val = s_quant
-                        
-                        if scale_val is not None:
-                            # input_scale (if exists in state_dict) is handled implicitly by not passing it,
-                            # or strictly ignored by load_quantized.
-                            new_module.load_quantized(w_quant, scale_val)
-                            loaded_quant = True
-                            apply_quantization._stats["loaded_learned"] += 1
-                except Exception as e:
-                    print(f"Failed to load quantized weights for {full_name}: {e}")
-
-        if not loaded_quant:
-            new_module.weight.data.copy_(module.weight.data)
-            new_module.quantize()
-            apply_quantization._stats["quantized_on_fly"] += 1
-        
-        if module.bias is not None:
-            new_module.bias.data.copy_(module.bias.data)
-        
-        new_module.compute_dtype = compute_dtype
-        new_module.to(module.weight.device)
-        
-        if isinstance(key, int):
-            parent[key] = new_module
-        else:
-            setattr(parent, key, new_module)
-        return True
-
-    if isinstance(parent_module, (nn.ModuleList, nn.Sequential)):
-        for i, module in enumerate(parent_module):
-            full_name = f"{prefix}.{i}" if prefix else str(i)
-            if isinstance(module, nn.Linear) and not isinstance(module, LinearW8A8):
-                replace_linear(module, full_name, parent_module, i)
-            else:
-                apply_quantization(module, compute_dtype, visited_modules, exclude_names, full_name, state_dict)
-    else:
-        for name, module in parent_module.named_children():
-            full_name = f"{prefix}.{name}" if prefix else name
-            if isinstance(module, nn.Linear) and not isinstance(module, LinearW8A8):
-                replace_linear(module, full_name, parent_module, name)
-            else:
-                apply_quantization(module, compute_dtype, visited_modules, exclude_names, full_name, state_dict)
-    
-    if not prefix:
-        stats = apply_quantization._stats
-        print(f"Quantization complete: {stats['loaded_learned']} layers loaded, {stats['quantized_on_fly']} quantized on-fly")
-    
-    return parent_module
 
 
 # =============================================================================
@@ -468,14 +316,14 @@ if _COMFY_OPS_AVAILABLE:
                         if is_excluded or is_dim1 or Int8TensorwiseOps._is_prequantized:
                             self._is_quantized = False
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-                            print("Not quantizing", prefix)
+                            #print("Not quantizing", prefix)
                         else:
                             # Quantize on the fly
                             # We seriously need to avoid doing this when loading a prequantized model
                             device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
                             w_gpu = weight_tensor.to(device, non_blocking=True)
                             q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
-                            print("Quantizing", prefix)
+                            #print("Quantizing", prefix)
                             
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
                             self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
