@@ -133,6 +133,61 @@ if _LORA_ADAPTER_AVAILABLE:
                 # Fallback: Standard Float Patching
                 return weight + (lora_diff * scale).to(weight.device, weight.dtype)
 
+    class INT8MergedLoRAPatchAdapter(LoRAAdapter):
+        """
+        Adapter that merges multiple LoRAs in float space BEFORE applying a single
+        stochastic rounding step. This is much more precise for LoRA stacks.
+        """
+        def __init__(self, patches, weight_scale, seed=0):
+            # We need to satisfy the base LoRAAdapter constructor.
+            # We use the first patch's keys/weights as a reference.
+            first_patch_adapter = patches[0][0]
+            super().__init__(first_patch_adapter.loaded_keys, first_patch_adapter.weights)
+            
+            # patches is a list of (adapter, strength)
+            self.patches = patches
+            self.weight_scale = weight_scale
+            self.seed = seed
+
+        def calculate_weight(self, weight, key, strength, strength_model, offset, function, intermediate_dtype=torch.float32, original_weight=None):
+            # Note: 'strength' from ComfyUI is ignored here as we use internal lora_strengths
+            device = weight.device
+            comp_device = torch.device("cuda") if torch.cuda.is_available() else device
+            
+            total_delta_f = None
+            
+            for adapter, lora_strength in self.patches:
+                v = adapter.weights
+                up, down, alpha = v[0], v[1], v[2]
+                
+                rank = down.shape[0] if down.ndim >= 2 else 1
+                scale = (alpha / rank) * lora_strength if alpha is not None else lora_strength
+                
+                up_f = up.to(comp_device, dtype=intermediate_dtype)
+                down_f = down.to(comp_device, dtype=intermediate_dtype)
+                
+                if v[3] is not None:
+                    mid_f = v[3].to(comp_device, dtype=intermediate_dtype)
+                    delta = torch.mm(up_f.flatten(1), torch.mm(mid_f.flatten(1), down_f.flatten(1))).reshape(weight.shape)
+                else:
+                    delta = torch.mm(up_f.flatten(1), down_f.flatten(1)).reshape(weight.shape)
+                
+                if total_delta_f is None:
+                    total_delta_f = delta * scale
+                else:
+                    total_delta_f += delta * scale
+            
+            if total_delta_f is None:
+                return weight
+
+            if weight.dtype == torch.int8:
+                # One single stochastic rounding step for all combined LoRAs
+                delta_int8 = stochastic_round_int8_delta(total_delta_f, self.weight_scale, self.seed)
+                res = weight.to(comp_device, torch.int32) + delta_int8.to(comp_device, torch.int32)
+                return torch.clamp(res, -128, 127).to(torch.int8).to(device)
+            else:
+                return weight + total_delta_f.to(device, weight.dtype)
+
 
 # =============================================================================
 # Dynamic LoRA Synchronization Hook
@@ -345,15 +400,22 @@ if _COMFY_OPS_AVAILABLE:
                     return _weight
                 return self.weight
 
-            def set_weight(self, out_weight, inplace_update=False, seed=0):
+            def set_weight(self, out_weight, inplace_update=False, seed=0, return_weight=False, **kwargs):
                 if not self._is_quantized:
+                    new_weight = out_weight.to(self.weight.dtype)
+                    if return_weight:
+                        return new_weight
+
                     if inplace_update:
-                        self.weight.data.copy_(out_weight)
+                        self.weight.data.copy_(new_weight)
                     else:
-                        self.weight = nn.Parameter(out_weight.to(self.weight.dtype), requires_grad=False)
+                        self.weight = nn.Parameter(new_weight, requires_grad=False)
                     return
 
                 if out_weight.dtype == torch.int8:
+                    if return_weight:
+                        return out_weight
+
                     if inplace_update:
                         self.weight.data.copy_(out_weight)
                     else:
@@ -363,18 +425,27 @@ if _COMFY_OPS_AVAILABLE:
                 # Re-quantize if fallback occurred
                 from .int8_quant import stochastic_round_int8_delta
                 new_weight = stochastic_round_int8_delta(out_weight, self.weight_scale, seed)
+                
+                if return_weight:
+                    return new_weight
+
                 if inplace_update:
                     self.weight.data.copy_(new_weight)
                 else:
                     self.weight = nn.Parameter(new_weight, requires_grad=False)
 
-            def set_bias(self, out_bias, inplace_update=False, seed=0):
-                if out_bias is None: return
+            def set_bias(self, out_bias, inplace_update=False, seed=0, return_weight=False, **kwargs):
+                if out_bias is None: return None
+                
+                new_bias = out_bias
+                if return_weight:
+                    return new_bias
+
                 if inplace_update:
                     if self.bias is not None:
-                        self.bias.data.copy_(out_bias)
+                        self.bias.data.copy_(new_bias)
                 else:
-                    self.bias = nn.Parameter(out_bias, requires_grad=False)
+                    self.bias = nn.Parameter(new_bias, requires_grad=False)
 
             def forward(self, x: Tensor) -> Tensor:
                 """Fast forward using torch._int_mm for quantized weights."""

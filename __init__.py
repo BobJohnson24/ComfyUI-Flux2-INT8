@@ -84,12 +84,13 @@ except ImportError:
 # Wrap imports in try/except to prevent total failure if dependencies are missing
 try:
     from .int8_unet_loader import UNetLoaderINTW8A8
-    from .int8_lora import INT8LoraLoader
+    from .int8_lora import INT8LoraLoader, INT8LoraLoaderStack
     from .int8_dynamic_lora import INT8DynamicLoraLoader, INT8DynamicLoraStack
     
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
         "INT8LoraLoader": INT8LoraLoader,
+        "INT8LoraLoaderStack": INT8LoraLoaderStack,
         "INT8DynamicLoraLoader": INT8DynamicLoraLoader,
         "INT8DynamicLoraStack": INT8DynamicLoraStack,
     }
@@ -97,6 +98,7 @@ try:
     NODE_DISPLAY_NAME_MAPPINGS = {
         "OTUNetLoaderW8A8": "Load Diffusion Model INT8 (W8A8)",
         "INT8LoraLoader": "Load LoRA INT8 (Stochastic)",
+        "INT8LoraLoaderStack": "INT8 LoRA Stack (Stochastic)",
         "INT8DynamicLoraLoader": "Load LoRA INT8 (Dynamic)",
         "INT8DynamicLoraStack": "INT8 LoRA Stack (Dynamic)",
     }
