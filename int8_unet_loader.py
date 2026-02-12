@@ -21,7 +21,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp16", "bf16"],),
-                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen"],),
+                "model_type": (["flux2", "z-image", "chroma", "wan", "ltx2", "qwen", "anima"],),
             }
         }
 
@@ -76,6 +76,10 @@ class UNetLoaderINTW8A8:
                 'adaln_single', 'audio_adaln_single', 'audio_caption_projection', 'audio_patchify_proj', 'audio_proj_out',
                 'audio_scale_shift_table', 'av_ca_a2v_gate_adaln_single', 'av_ca_audio_scale_shift_adaln_single', 'av_ca_v2a_gate_adaln_single',
                 'av_ca_video_scale_shift_adaln_single', 'caption_projection', 'patchify_proj', 'proj_out', 'scale_shift_table',
+            ]
+        elif model_type == "anima":
+            Int8TensorwiseOps.excluded_names = [
+                    "t_embedder", "x_embedder", "final_layer", "llm_adapter", "adaln_modulation",
             ]
             #print(f"Applying model-specific exclusions to Int8TensorwiseOps: {Int8TensorwiseOps.excluded_names}")
 
