@@ -1,18 +1,82 @@
+import os
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-# Add this at the top of your file
+# =============================================================================
+# Global Configuration (must be defined before use in lazy-loading functions)
+# =============================================================================
+
+_DEBUG_MODE = False
+_DEBUG_FORWARD = False
+
+if os.environ.get("INT8_DEBUG_MODE", "").lower() in ("1", "true", "yes"):
+    _DEBUG_MODE = True
+
+_TRITON_AVAILABLE = False
 try:
-    from .int8_fused_kernel import triton_int8_linear
+    import triton
     _TRITON_AVAILABLE = True
 except ImportError:
-    _TRITON_AVAILABLE = False
-    print("Triton not found, falling back to torch._int_mm")
+    pass
+
+# =============================================================================
+# Lazy Loaders for Kernels
+# =============================================================================
+
+_triton_kernels = None
+
+def _get_triton_kernels():
+    """Lazy import of triton kernels to avoid import errors when Triton not available."""
+    global _triton_kernels
+    if _triton_kernels is None and _TRITON_AVAILABLE:
+        try:
+            from .triton_kernels import triton_int8_linear
+            _triton_kernels = triton_int8_linear
+        except ImportError as e:
+            if _DEBUG_MODE:
+                print(f"[DEBUG] Failed to import triton_int8_linear: {e}")
+    return _triton_kernels
+
+
+CHUNK_THRESHOLD_ELEMENTS = 67_108_864
+CHUNK_TARGET_ELEMENTS = 33_554_432
+
+
+_quantize_int8_jit = None
+_dequantize_jit = None
+
+def _get_quantize_int8_jit():
+    global _quantize_int8_jit
+    if _quantize_int8_jit is None:
+        try:
+            @torch.jit.script
+            def _quantize_int8_script(x: torch.Tensor, scale: float) -> torch.Tensor:
+                return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
+            _quantize_int8_jit = _quantize_int8_script
+        except: pass
+    return _quantize_int8_jit
+
+def _get_dequantize_jit():
+    global _dequantize_jit
+    if _dequantize_jit is None:
+        try:
+            @torch.jit.script
+            def _dequantize_script(q: torch.Tensor, scale: float) -> torch.Tensor:
+                return q.float().mul(scale)
+            _dequantize_jit = _dequantize_script
+        except: pass
+    return _dequantize_jit
+
 
 # --- Quantization Utils ---
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
+    if isinstance(scale, (int, float)):
+        jit_fn = _get_quantize_int8_jit()
+        if jit_fn is not None:
+            try: return jit_fn(x, float(scale))
+            except: pass
     return x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
 
 def quantize_int8_tensorwise(x: Tensor) -> tuple[Tensor, Tensor]:
@@ -26,7 +90,20 @@ def quantize_int8_axiswise(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
     return quantize_int8(x, scale), scale
 
 def dequantize(q: Tensor, scale: float | Tensor) -> Tensor:
+    """Dequantize INT8 tensor to float."""
+
+    if isinstance(scale, (int, float)):
+        jit_fn = _get_dequantize_jit()
+        if jit_fn is not None:
+            try: return jit_fn(q, float(scale))
+            except: pass
+    
+    if isinstance(scale, Tensor) and scale.numel() > 1:
+        scale = scale.view(-1, 1) if q.ndim == 2 else scale.view(-1)
+    
     return q.float() * scale
+
+# QuIP transformed storage stuff removed.
 
 def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0) -> Tensor:
     """
@@ -35,6 +112,10 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
     """
     generator = torch.Generator(device=x.device)
     generator.manual_seed(seed)
+    
+    # Move scale to correct device if it's a tensor
+    if isinstance(scale, torch.Tensor):
+        scale = scale.to(x.device)
     
     # Scale to INT8 range
     x_scaled = x / scale
@@ -57,23 +138,33 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     """Forward with dynamic per-token activation quantization."""
     
     # --- FAST PATH: Triton Fused Kernel ---
-    if _TRITON_AVAILABLE and x.is_cuda:
-        return triton_int8_linear(x, weight, weight_scale, bias, compute_dtype)
+    triton_kernels = _get_triton_kernels()
+    if triton_kernels is not None and x.is_cuda and x.ndim >= 2:
+        try:
+            return triton_kernels(x, weight, weight_scale, bias, compute_dtype)
+        except Exception as e:
+            if _DEBUG_MODE: print(f"[DEBUG] Triton fallback in int8_forward_dynamic: {e}")
 
     # --- SLOW PATH: Standard PyTorch ---
-    # Quantize activations per row (dynamic)
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
-    
-    # INT8 Matmul (Outputs Int32)
-    res = torch._int_mm(x_8, weight.T)
-    
-    # Dequantize: (res * weight_scale * x_scale)
-    # Note: Creating intermediate Float tensors here is VRAM heavy
-    res_scaled = res.float().mul_(weight_scale * x_scale).to(compute_dtype)
+    res = torch._int_mm(x_8.reshape(-1, x_8.shape[-1]), weight.T)
+    res_scaled = res.float().mul_(weight_scale * x_scale.reshape(-1, 1)).to(compute_dtype)
     
     if bias is not None:
         res_scaled = res_scaled + bias.to(compute_dtype)
-    return res_scaled
+    return res_scaled.reshape(*x.shape[:-1], weight.shape[0])
+
+
+@torch.no_grad()
+def int8_forward_static(x: Tensor, weight: Tensor, weight_scale: float | Tensor, input_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+    """Forward with static (learned) activation quantization."""
+    x_8 = quantize_int8(x, input_scale)
+    res = torch._int_mm(x_8.reshape(-1, x_8.shape[-1]), weight.T)
+    res_scaled = res.float().mul_(weight_scale * input_scale).to(compute_dtype)
+    
+    if bias is not None:
+        res_scaled = res_scaled + bias.to(compute_dtype)
+    return res_scaled.reshape(*x.shape[:-1], weight.shape[0])
 
 
 
@@ -120,6 +211,9 @@ if _LORA_ADAPTER_AVAILABLE:
             else:
                 lora_diff = torch.mm(up_f.flatten(1), down_f.flatten(1)).reshape(weight.shape)
             
+            # QuIP Transform: Apply Hadamard + sign flips to delta if enabled
+            # Removed for simplification.
+
             # Apply Patch
             if weight.dtype == torch.int8:
                 # --- INT8 SPACE PATCHING ---
@@ -179,6 +273,9 @@ if _LORA_ADAPTER_AVAILABLE:
             
             if total_delta_f is None:
                 return weight
+
+            # QuIP Transform: Apply Hadamard + sign flips to combined delta if enabled
+            # Removed for simplification.
 
             if weight.dtype == torch.int8:
                 # One single stochastic rounding step for all combined LoRAs
@@ -326,61 +423,50 @@ if _COMFY_OPS_AVAILABLE:
                 input_scale_key = prefix + "input_scale"
                 bias_key = prefix + "bias"
                 
+                # Pop QuIP-related keys if they exist, but don't store them
+                for k in ["hadamard_quip", "hadamard_size_in", "hadamard_size_out", 
+                          "sign_row", "sign_col", "quip_s_u", "quip_s_v", "comfy_quant"]:
+                    state_dict.pop(prefix + k, None)
+                
                 weight_scale = state_dict.pop(scale_key, None)
-                state_dict.pop(prefix + "comfy_quant", None)
                 weight_tensor = state_dict.pop(weight_key, None)
-
-                # Pop input_scale to clean state_dict, but ignore it
-                _ = state_dict.pop(input_scale_key, None)
+                input_scale = state_dict.pop(input_scale_key, None)
                 
                 if weight_tensor is not None:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
                         # Load Quantized
                         self._is_quantized = True
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-                        Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
+                        Int8TensorwiseOps._is_prequantized = True
                         
                         if isinstance(weight_scale, torch.Tensor):
                             self.weight_scale = weight_scale.float().item() if weight_scale.numel() == 1 else weight_scale.float()
                         else:
                             self.weight_scale = float(weight_scale)
                             
-                    elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                        # Load High-Precision
-                        # Detect if the model is pre-quantized if we don't know yet
-                        if Int8TensorwiseOps._is_prequantized is None:
-                            # Robust detection: scan keys and a sample of values
-                            is_prequant = False
-                            for k in state_dict.keys():
-                                if "weight_scale" in k or "comfy_quant" in k:
-                                    is_prequant = True
-                                    break
+                        if input_scale is not None:
+                            self.register_buffer("input_scale", input_scale.float() if isinstance(input_scale, torch.Tensor) else torch.tensor(input_scale, dtype=torch.float32))
                             
-                            if not is_prequant:
-                                # Fallback: scan a sample of values for int8 tensors
-                                for i, v in enumerate(state_dict.values()):
-                                    if i > 200: break # Safety limit
-                                    if getattr(v, "dtype", None) == torch.int8:
-                                        is_prequant = True
-                                        break
-                            Int8TensorwiseOps._is_prequantized = is_prequant
-
-                        is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
-                        is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
-                        
-                        if is_excluded or is_dim1 or Int8TensorwiseOps._is_prequantized:
+                    elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                        if not getattr(Int8TensorwiseOps, "auto_convert_to_int8", False):
                             self._is_quantized = False
                             self.weight = nn.Parameter(weight_tensor, requires_grad=False)
-                            #print("Not quantizing", prefix)
                         else:
-                            # Quantize on the fly
-                            # We seriously need to avoid doing this when loading a prequantized model
-                            device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
-                            w_gpu = weight_tensor.to(device, non_blocking=True)
-                            q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
-                            #print("Quantizing", prefix)
+                            is_excluded = any(ex in prefix for ex in Int8TensorwiseOps.excluded_names)
+                            is_dim1 = self.in_features == 1 or self.out_features == 1 or weight_tensor.ndim == 1
                             
-                            self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+                            if is_excluded or is_dim1:
+                                self._is_quantized = False
+                                self.weight = nn.Parameter(weight_tensor, requires_grad=False)
+                            else:
+                                # Quantize on the fly
+                                device = torch.device("cuda") if torch.cuda.is_available() else weight_tensor.device
+                                w_gpu = weight_tensor.to(device, non_blocking=True)
+                                q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
+                                
+                                self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
+                                self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
+                                self._is_quantized = True
                             self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
                             self._is_quantized = True
                     else:
@@ -469,17 +555,20 @@ if _COMFY_OPS_AVAILABLE:
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
+                # Standard INT8 Forward
                 if x_2d.shape[0] > 16:
-                    y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
+                    input_scale = getattr(self, "input_scale", None)
+                    if input_scale is not None:
+                        y = int8_forward_static(x_2d, weight, w_scale, input_scale, bias, compute_dtype)
+                    else:
+                        y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
                 else:
-                    # Small batch fallback
+                    # Small batch dequantize fallback
                     w_float = dequantize(weight, w_scale).to(x.dtype)
-                    bias_typed = bias.to(x.dtype) if bias is not None else None
-                    y = F.linear(x_2d, w_float, bias_typed)
+                    y = F.linear(x_2d, w_float, bias)
                 
-                # Dynamic LoRA Path
+                # Dynamic LoRA Path (Kept Simple)
                 if self.lora_A is not None and self.lora_B is not None:
-                    # Ensure LoRA tensors are on the same device as x
                     lA = self.lora_A.to(x.device, non_blocking=True)
                     lB = self.lora_B.to(x.device, non_blocking=True)
                     
