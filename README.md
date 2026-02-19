@@ -66,7 +66,7 @@ https://github.com/Nerogar/OneTrainer/pull/1034
 
 If you have a 30-Series GPU, OneTrainer is also the fastest current lora trainer thanks to this. Please go check them out!!
 
-##ThunderFun for their hard work on QUIP
+## ThunderFun for their hard work on QUIP
 https://github.com/ThunderFun/ComfyUI-Wan-INT8
 
 ## silveroxides for providing a base to hack the INT8 conversion code onto.
