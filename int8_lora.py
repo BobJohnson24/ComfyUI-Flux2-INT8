@@ -182,7 +182,11 @@ class INT8LoraLoaderStack:
                     applied_count += 1
                 
                 # Use our specialized merged adapter
-                final_patch_dict[key] = INT8MergedLoRAPatchAdapter(patches, w_scale, seed=seed)
+                final_patch_dict[key] = INT8MergedLoRAPatchAdapter(
+                    patches, 
+                    w_scale, 
+                    seed=seed
+                )
                 
             except Exception:
                 # Fallback: apply sequentially if resolution fails
