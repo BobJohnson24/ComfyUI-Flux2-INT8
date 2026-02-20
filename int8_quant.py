@@ -441,7 +441,7 @@ if _COMFY_OPS_AVAILABLE:
                         Int8TensorwiseOps._is_prequantized = True
                         
                         if isinstance(weight_scale, torch.Tensor):
-                            self.weight_scale = weight_scale.float().item() if weight_scale.numel() == 1 else weight_scale.float()
+                            self.weight_scale = weight_scale.float().reshape(-1)
                         else:
                             self.weight_scale = float(weight_scale)
                             
@@ -466,7 +466,7 @@ if _COMFY_OPS_AVAILABLE:
                                 q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
                                 
                                 self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
-                                self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
+                                self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else torch.tensor(q_scale, dtype=torch.float32).reshape(-1)
                                 self._is_quantized = True
                     else:
                         self._is_quantized = False
