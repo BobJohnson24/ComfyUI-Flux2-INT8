@@ -816,6 +816,12 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
             HAS_BIAS=has_bias,
             HAS_PER_CHANNEL_SCALE=has_per_channel_scale,
             OUT_DTYPE=out_tl,
+            BM=_AMPERE_BLOCK_M,              # ADDED
+            BN=_AMPERE_BLOCK_N,              # ADDED
+            BK=_AMPERE_BLOCK_K,              # ADDED
+            GROUP_M=_AMPERE_GROUP_M,         # ADDED
+            num_warps=_AMPERE_NUM_WARPS,     # ADDED (for perf)
+            num_stages=_AMPERE_NUM_STAGES,   # ADDED (for perf)
         )
     else:
         # Use fixed fallback kernel for older GPUs
@@ -1062,6 +1068,12 @@ def triton_hadamard_quip_linear(
             HAS_BIAS=has_bias,
             HAS_PER_CHANNEL_SCALE=has_per_channel_scale,
             OUT_DTYPE=out_tl,
+            BM=_AMPERE_BLOCK_M,              # ADDED
+            BN=_AMPERE_BLOCK_N,              # ADDED
+            BK=_AMPERE_BLOCK_K,              # ADDED
+            GROUP_M=_AMPERE_GROUP_M,         # ADDED
+            num_warps=_AMPERE_NUM_WARPS,     # ADDED (for perf)
+            num_stages=_AMPERE_NUM_STAGES,   # ADDED (for perf)
         )
     else:
         # Use fixed fallback kernel for older GPUs
