@@ -1,4 +1,5 @@
 import torch
+import os
 from torch import Tensor, nn
 import torch.nn.functional as F
 
@@ -9,6 +10,19 @@ try:
 except ImportError:
     _TRITON_AVAILABLE = False
     print("Triton not found, falling back to torch._int_mm")
+
+try:
+    _disable_torch_compile = torch.compiler.disable
+except Exception:
+    def _disable_torch_compile(fn):
+        return fn
+
+try:
+    _SMALL_BATCH_FALLBACK_MAX_ROWS = max(0, int(os.environ.get("INT8_SMALL_BATCH_FALLBACK_MAX_ROWS", "16")))
+except ValueError:
+    _SMALL_BATCH_FALLBACK_MAX_ROWS = 16
+
+_DYNAMIC_LORA_DEBUG = os.environ.get("INT8_DYNAMIC_LORA_DEBUG", "0") == "1"
 
 # --- Quantization Utils ---
 
@@ -53,6 +67,7 @@ def stochastic_round_int8_delta(x: Tensor, scale: float | Tensor, seed: int = 0)
 # --- LinearW8A8 Core ---
 
 @torch.no_grad()
+@_disable_torch_compile
 def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
     """Forward with dynamic per-token activation quantization."""
     
@@ -74,6 +89,85 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     if bias is not None:
         res_scaled = res_scaled + bias.to(compute_dtype)
     return res_scaled
+
+@torch.no_grad()
+@_disable_torch_compile
+def apply_dynamic_lora_delta(
+    x_2d: Tensor,
+    y: Tensor,
+    lora_A: Tensor | None,
+    lora_B: Tensor | None,
+    lora_alpha,
+    lora_entries,
+    device: torch.device,
+) -> Tensor:
+    if lora_entries:
+        for entry in lora_entries:
+            entry_A = entry.get("A")
+            entry_B = entry.get("B")
+            offset = entry.get("offset")
+            if entry_A is None or entry_B is None:
+                continue
+
+            lA = entry_A if entry_A.device == device else entry_A.to(device, non_blocking=True)
+            lB = entry_B if entry_B.device == device else entry_B.to(device, non_blocking=True)
+            x_src = x_2d
+
+            if offset is not None and len(offset) >= 3 and int(offset[0]) == 1:
+                start = int(offset[1])
+                length = int(offset[2])
+                if start >= 0 and length > 0 and (start + length) <= x_2d.shape[-1]:
+                    x_src = x_2d.narrow(-1, start, length)
+                else:
+                    if _DYNAMIC_LORA_DEBUG:
+                        print(f"[INT8 Dynamic LoRA] skipping invalid input offset={offset} for x shape={tuple(x_2d.shape)}")
+                    continue
+
+            lora_x = F.linear(x_src.to(lA.dtype), lA)
+            lora_y = F.linear(lora_x, lB).to(y.dtype)
+
+            if offset is not None and len(offset) >= 3 and int(offset[0]) == 0:
+                start = int(offset[1])
+                length = int(offset[2])
+                if lora_y.shape[-1] != length:
+                    if _DYNAMIC_LORA_DEBUG:
+                        print(
+                            f"[INT8 Dynamic LoRA] skipping mismatched output slice "
+                            f"offset={offset} lora_y={tuple(lora_y.shape)} y={tuple(y.shape)}"
+                        )
+                    continue
+                if start >= 0 and length > 0 and (start + length) <= y.shape[-1]:
+                    y.narrow(-1, start, length).add_(lora_y)
+                else:
+                    if _DYNAMIC_LORA_DEBUG:
+                        print(f"[INT8 Dynamic LoRA] skipping invalid output offset={offset} for y shape={tuple(y.shape)}")
+                continue
+
+            if lora_y.shape[-1] != y.shape[-1]:
+                if _DYNAMIC_LORA_DEBUG:
+                    print(
+                        f"[INT8 Dynamic LoRA] skipping mismatched full add "
+                        f"lora_y={tuple(lora_y.shape)} y={tuple(y.shape)} offset={offset}"
+                    )
+                continue
+
+            y.add_(lora_y)
+
+        return y
+
+    if lora_A is None or lora_B is None:
+        return y
+
+    lA = lora_A if lora_A.device == device else lora_A.to(device, non_blocking=True)
+    lB = lora_B if lora_B.device == device else lora_B.to(device, non_blocking=True)
+
+    lora_x = F.linear(x_2d.to(lA.dtype), lA)
+    lora_y = F.linear(lora_x, lB)
+
+    if lora_alpha is not None:
+        lora_y = lora_y * lora_alpha
+
+    return y + lora_y.to(y.dtype)
 
 
 
@@ -201,6 +295,44 @@ class DynamicLoRAHook:
     def __init__(self):
         self.current_lora_id = None
 
+    @staticmethod
+    def _compute_lora_id(dynamic_loras):
+        if not dynamic_loras:
+            return None
+        # Use stable values so per-step dict/list cloning does not force recompose.
+        return hash(tuple(
+            (
+                entry.get("name", ""),
+                float(entry.get("strength", 0.0)),
+                len(entry.get("patches", {})),
+            )
+            for entry in dynamic_loras
+        ))
+
+    @classmethod
+    @_disable_torch_compile
+    def sync_from_transformer_options(cls, diffusion_model, transformer_options):
+        if transformer_options is None:
+            transformer_options = {}
+
+        dynamic_loras = transformer_options.get("dynamic_loras", [])
+        target_modules = []
+
+        if diffusion_model is not None:
+            target_modules.append(diffusion_model)
+            orig_mod = getattr(diffusion_model, "_orig_mod", None)
+            if orig_mod is not None:
+                target_modules.append(orig_mod)
+
+        for module in target_modules:
+            hook = cls.register(module)
+            lora_id = cls._compute_lora_id(dynamic_loras)
+            if lora_id == hook.current_lora_id:
+                continue
+            hook.apply_composition(module, dynamic_loras)
+            hook.current_lora_id = lora_id
+
+    @_disable_torch_compile
     def pre_forward(self, module, input_args, input_kwargs):
         # 1. Try to find transformer_options
         transformer_options = input_kwargs.get("transformer_options", {})
@@ -212,9 +344,8 @@ class DynamicLoRAHook:
         
         dynamic_loras = transformer_options.get("dynamic_loras", [])
         
-        # 2. Generate a unique ID for this set of LoRAs
-        # We use handles/strengths to detect changes
-        lora_id = hash(tuple((id(d["patches"]), d["strength"]) for d in dynamic_loras)) if dynamic_loras else None
+        # 2. Generate a stable ID for this set of LoRAs
+        lora_id = self._compute_lora_id(dynamic_loras)
         
         if lora_id == self.current_lora_id:
             return None # Already synchronized
@@ -224,40 +355,80 @@ class DynamicLoRAHook:
         self.current_lora_id = lora_id
         return None
 
+    @_disable_torch_compile
     def apply_composition(self, diffusion_model, dynamic_loras):
+        def normalize_patch_key(raw_key):
+            key = raw_key[0] if isinstance(raw_key, tuple) else raw_key
+            if not isinstance(key, str):
+                return None
+
+            if key.endswith(".weight"):
+                key = key[:-7]
+
+            if key.startswith("diffusion_model."):
+                key = key[len("diffusion_model."):]
+            elif key.startswith("model.diffusion_model."):
+                key = key[len("model.diffusion_model."):]
+            elif key.startswith("model."):
+                key = key[len("model."):]
+
+            if key.startswith("_orig_mod.diffusion_model."):
+                key = key[len("_orig_mod.diffusion_model."):]
+            elif key.startswith("_orig_mod."):
+                key = key[len("_orig_mod."):]
+
+            return key
+
+        def normalize_module_name(module_name):
+            name = module_name
+            if name.startswith("_orig_mod.diffusion_model."):
+                name = name[len("_orig_mod.diffusion_model."):]
+            elif name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+            elif name.startswith("diffusion_model."):
+                name = name[len("diffusion_model."):]
+            elif name.startswith("model.diffusion_model."):
+                name = name[len("model.diffusion_model."):]
+            elif name.startswith("model."):
+                name = name[len("model."):]
+            return name
+
         # Pre-group patches by layer
         layer_patches = {}
         if dynamic_loras:
             for entry in dynamic_loras:
                 strength = entry["strength"]
                 for key, adapter in entry["patches"].items():
-                    if key not in layer_patches: layer_patches[key] = []
-                    layer_patches[key].append((adapter, strength))
+                    normalized_key = normalize_patch_key(key)
+                    if normalized_key is None:
+                        continue
+                    offset = key[1] if isinstance(key, tuple) and len(key) > 1 else None
+                    if normalized_key not in layer_patches:
+                        layer_patches[normalized_key] = []
+                    layer_patches[normalized_key].append((adapter, strength, offset))
 
         # Update all modules
+        candidate_modules = 0
+        matched_modules = 0
         for name, module in diffusion_model.named_modules():
             if not hasattr(module, "lora_A"):
                 continue
+            candidate_modules += 1
             
-            # Find patches for this module
-            # ComfyUI keys are often 'diffusion_model.path.to.weight' or 'path.to.weight'
-            possible_keys = [f"diffusion_model.{name}.weight", f"{name}.weight"]
-            patches = None
-            for pk in possible_keys:
-                if pk in layer_patches:
-                    patches = layer_patches[pk]
-                    break
+            normalized_name = normalize_module_name(name)
+            patches = layer_patches.get(normalized_name)
             
             if not patches:
+                module.dynamic_lora_entries = None
                 module.lora_A = None
                 module.lora_B = None
                 module.lora_alpha = None
                 continue
 
             # Compose
-            all_A = []
-            all_B = []
-            for adapter, strength in patches:
+            matched_modules += 1
+            entries = []
+            for adapter, strength, offset in patches:
                 v = adapter.weights
                 up, down, alpha, mid = v[0], v[1], v[2], v[3]
                 rank = down.shape[0] if down.ndim >= 2 else 1
@@ -266,18 +437,36 @@ class DynamicLoRAHook:
                 curr_A = down
                 if mid is not None:
                     curr_A = torch.mm(mid.flatten(1), down.flatten(1)).reshape(down.shape)
-                
-                all_A.append(curr_A * scale)
-                all_B.append(up)
-            
-            if all_A:
+
+                entries.append({
+                    "A": curr_A * scale,
+                    "B": up,
+                    "offset": offset,
+                })
+
+            if entries:
                 device = getattr(module, "weight", torch.tensor(0)).device
-                module.lora_A = torch.cat(all_A, dim=0).to(device)
-                module.lora_B = torch.cat(all_B, dim=1).to(device)
-                module.lora_alpha = None
+                module.dynamic_lora_entries = [
+                    {
+                        "A": entry["A"].to(device),
+                        "B": entry["B"].to(device),
+                        "offset": entry["offset"],
+                    }
+                    for entry in entries
+                ]
             else:
-                module.lora_A = None
-                module.lora_B = None
+                module.dynamic_lora_entries = None
+
+            # Keep legacy fields unset to force offset-aware entry path.
+            module.lora_A = None
+            module.lora_B = None
+            module.lora_alpha = None
+
+        if _DYNAMIC_LORA_DEBUG:
+            print(
+                f"[INT8 Dynamic LoRA] candidate_modules={candidate_modules} "
+                f"patch_keys={len(layer_patches)} matched_modules={matched_modules}"
+            )
 
     @classmethod
     def register(cls, diffusion_model):
@@ -314,6 +503,7 @@ if _COMFY_OPS_AVAILABLE:
                 self.weight_scale = None
                 self._is_quantized = False
                 self.compute_dtype = torch.bfloat16
+                self.dynamic_lora_entries = None
                 self.lora_A = None
                 self.lora_B = None
                 self.lora_alpha = None
@@ -403,7 +593,6 @@ if _COMFY_OPS_AVAILABLE:
                     return
 
                 # Re-quantize if fallback occurred
-                from .int8_quant import stochastic_round_int8_delta
                 new_weight = stochastic_round_int8_delta(out_weight, self.weight_scale, seed)
                 
                 if return_weight:
@@ -437,39 +626,41 @@ if _COMFY_OPS_AVAILABLE:
                     return out
                 
                 # 1. Move weight/bias/scale to device (non_blocking)
-                weight = self.weight.to(x.device, non_blocking=True)
-                bias = self.bias.to(x.device, non_blocking=True) if self.bias is not None else None
+                weight = self.weight if self.weight.device == x.device else self.weight.to(x.device, non_blocking=True)
+                if self.bias is None:
+                    bias = None
+                else:
+                    bias = self.bias if self.bias.device == x.device else self.bias.to(x.device, non_blocking=True)
                 
                 w_scale = self.weight_scale
                 if isinstance(w_scale, torch.Tensor):
-                    w_scale = w_scale.to(x.device, non_blocking=True)
+                    if w_scale.device != x.device:
+                        w_scale = w_scale.to(x.device, non_blocking=True)
                 
                 compute_dtype = x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
                 
                 x_shape = x.shape
                 x_2d = x.reshape(-1, x_shape[-1])
                 
-                if x_2d.shape[0] > 16:
-                    y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
-                else:
+                use_small_batch_fallback = _SMALL_BATCH_FALLBACK_MAX_ROWS > 0 and x_2d.shape[0] <= _SMALL_BATCH_FALLBACK_MAX_ROWS
+                if use_small_batch_fallback:
                     # Small batch fallback
                     w_float = dequantize(weight, w_scale).to(x.dtype)
                     bias_typed = bias.to(x.dtype) if bias is not None else None
                     y = F.linear(x_2d, w_float, bias_typed)
+                else:
+                    y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
                 
                 # Dynamic LoRA Path
-                if self.lora_A is not None and self.lora_B is not None:
-                    # Ensure LoRA tensors are on the same device as x
-                    lA = self.lora_A.to(x.device, non_blocking=True)
-                    lB = self.lora_B.to(x.device, non_blocking=True)
-                    
-                    lora_x = F.linear(x_2d.to(lA.dtype), lA)
-                    lora_y = F.linear(lora_x, lB)
-                    
-                    if self.lora_alpha is not None:
-                        lora_y = lora_y * self.lora_alpha
-                    
-                    y = y + lora_y.to(y.dtype)
+                y = apply_dynamic_lora_delta(
+                    x_2d=x_2d,
+                    y=y,
+                    lora_A=self.lora_A,
+                    lora_B=self.lora_B,
+                    lora_alpha=self.lora_alpha,
+                    lora_entries=self.dynamic_lora_entries,
+                    device=x.device,
+                )
                 
                 return y.reshape(*x_shape[:-1], y.shape[-1])
         
