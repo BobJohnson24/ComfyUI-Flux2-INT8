@@ -55,8 +55,8 @@ _shown_kernel_info = False
 _KERNEL_TABLE = {
     "ada": "ampere",
     "ampere": "ampere",
-    "turing": "ampere",  # Uses fallback configs in autotune
-    "older": "older",  # Use fixed kernel for older GPUs
+    "turing": "ampere",
+    "older": "older",
 }
 
 def pick_gemm_kernel_with_logging(device=None):
@@ -79,7 +79,7 @@ def pick_gemm_kernel_with_logging(device=None):
                 _shown_kernel_info = True
             return "older"
     
-    arch = gpu_family(device)
+    arch = get_gpu_arch()
     kernel_name = _KERNEL_TABLE.get(arch, "older")
     
     if not _shown_kernel_info and _LOG_KERNEL_SELECTION:
@@ -456,7 +456,7 @@ def triton_quantize_rowwise(x: torch.Tensor):
     y = torch.empty_like(x, dtype=torch.int8)
     s = torch.empty((rows, 1), device=x.device, dtype=torch.float32)
     
-    BLOCK_SIZE = 4096 if cols > 4096 else next_power_of_two(cols)
+    BLOCK_SIZE = next_power_of_two(cols)
     if BLOCK_SIZE < 128: BLOCK_SIZE = 128
     
     grid = (rows,)
@@ -474,13 +474,17 @@ def triton_quantize_rowwise(x: torch.Tensor):
 # but produced incorrect results for large matrices (e.g., 311x3072x27648).
 # Using a fixed, safe configuration that works for all sizes.
 
-_FIXED_BLOCK_M = 128
-_FIXED_BLOCK_N = 128
-_FIXED_BLOCK_K = 32
-_FIXED_GROUP_SIZE_M = 8
-_FIXED_NUM_WARPS = 4
-_FIXED_NUM_STAGES = 4
-
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def _int8_matmul_dequant_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -584,10 +588,10 @@ def _int8_gemm_dequant_ampere(
     HAS_BIAS: tl.constexpr,
     HAS_PER_CHANNEL_SCALE: tl.constexpr,
     OUT_DTYPE: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    BK: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    BM: tl.constexpr = _AMPERE_BLOCK_M,
+    BN: tl.constexpr = _AMPERE_BLOCK_N,
+    BK: tl.constexpr = _AMPERE_BLOCK_K,
+    GROUP_M: tl.constexpr = _AMPERE_GROUP_M,
 ):
     """
     Ampere-tuned INT8 GEMM with fused dequantization.
@@ -734,16 +738,9 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
             HAS_BIAS=has_bias,
             HAS_PER_CHANNEL_SCALE=has_per_channel_scale,
             OUT_DTYPE=out_tl,
-            BM=_AMPERE_BLOCK_M,              # ADDED
-            BN=_AMPERE_BLOCK_N,              # ADDED
-            BK=_AMPERE_BLOCK_K,              # ADDED
-            GROUP_M=_AMPERE_GROUP_M,         # ADDED
-            num_warps=_AMPERE_NUM_WARPS,     # ADDED (for perf)
-            num_stages=_AMPERE_NUM_STAGES,   # ADDED (for perf)
         )
     else:
-        # Use fixed fallback kernel for older GPUs
-        grid = (triton.cdiv(M, _FIXED_BLOCK_M) * triton.cdiv(N, _FIXED_BLOCK_N),)
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
         _int8_matmul_dequant_kernel[grid](
             a_ptr=x_int8,
             b_ptr=weight,
@@ -755,14 +752,8 @@ def triton_int8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale, bias
             stride_am=x_int8.stride(0), stride_ak=x_int8.stride(1),
             stride_bk=weight.stride(1), stride_bn=weight.stride(0),
             stride_cm=output.stride(0), stride_cn=output.stride(1),
-            BLOCK_M=_FIXED_BLOCK_M,
-            BLOCK_N=_FIXED_BLOCK_N,
-            BLOCK_K=_FIXED_BLOCK_K,
-            GROUP_SIZE_M=_FIXED_GROUP_SIZE_M,
             HAS_BIAS=has_bias,
             HAS_PER_CHANNEL_SCALE=has_per_channel_scale,
-            num_warps=_FIXED_NUM_WARPS,
-            num_stages=_FIXED_NUM_STAGES,
         )
     
     return output.reshape(x_shape_orig[:-1] + (N,))

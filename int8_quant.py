@@ -140,10 +140,7 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     # --- FAST PATH: Triton Fused Kernel ---
     triton_kernels = _get_triton_kernels()
     if triton_kernels is not None and x.is_cuda and x.ndim >= 2:
-        try:
-            return triton_kernels(x, weight, weight_scale, bias, compute_dtype)
-        except Exception as e:
-            if _DEBUG_MODE: print(f"[DEBUG] Triton fallback in int8_forward_dynamic: {e}")
+        return triton_kernels(x, weight, weight_scale, bias, compute_dtype)
 
     # --- SLOW PATH: Standard PyTorch ---
     x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
@@ -431,7 +428,8 @@ if _COMFY_OPS_AVAILABLE:
                 
                 weight_scale = state_dict.pop(scale_key, None)
                 weight_tensor = state_dict.pop(weight_key, None)
-                input_scale = state_dict.pop(input_scale_key, None)
+                # Pop input_scale to clean state_dict, but ignore it
+                _ = state_dict.pop(input_scale_key, None)
                 
                 if weight_tensor is not None:
                     if weight_tensor.dtype == torch.int8 and weight_scale is not None:
@@ -441,12 +439,9 @@ if _COMFY_OPS_AVAILABLE:
                         Int8TensorwiseOps._is_prequantized = True
                         
                         if isinstance(weight_scale, torch.Tensor):
-                            self.weight_scale = weight_scale.float().reshape(-1)
+                            self.weight_scale = weight_scale.float().item() if weight_scale.numel() == 1 else weight_scale.float()
                         else:
                             self.weight_scale = float(weight_scale)
-                            
-                        if input_scale is not None:
-                            self.register_buffer("input_scale", input_scale.float() if isinstance(input_scale, torch.Tensor) else torch.tensor(input_scale, dtype=torch.float32))
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
                         if not Int8TensorwiseOps.dynamic_quantize:
@@ -466,7 +461,7 @@ if _COMFY_OPS_AVAILABLE:
                                 q_weight, q_scale = quantize_int8_tensorwise(w_gpu)
                                 
                                 self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
-                                self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else torch.tensor(q_scale, dtype=torch.float32).reshape(-1)
+                                self.weight_scale = q_scale.cpu().item() if isinstance(q_scale, torch.Tensor) and q_scale.numel() == 1 else (q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale)
                                 self._is_quantized = True
                     else:
                         self._is_quantized = False
@@ -556,15 +551,12 @@ if _COMFY_OPS_AVAILABLE:
                 
                 # Standard INT8 Forward
                 if x_2d.shape[0] > 16:
-                    input_scale = getattr(self, "input_scale", None)
-                    if input_scale is not None:
-                        y = int8_forward_static(x_2d, weight, w_scale, input_scale, bias, compute_dtype)
-                    else:
-                        y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
+                    y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
                 else:
                     # Small batch dequantize fallback
                     w_float = dequantize(weight, w_scale).to(x.dtype)
-                    y = F.linear(x_2d, w_float, bias)
+                    bias_typed = bias.to(x.dtype) if bias is not None else None
+                    y = F.linear(x_2d, w_float, bias_typed)
                 
                 # Dynamic LoRA Path (Kept Simple)
                 if self.lora_A is not None and self.lora_B is not None:
