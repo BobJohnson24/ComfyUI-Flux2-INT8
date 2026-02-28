@@ -14,10 +14,9 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Performance:** ~1.15x slower due to dynamic calculations
 - **Quality:** Possibly slightly higher quality
 
-### Option 2B: KohakuBlueleaf's Node
+### Option 2B: Comfy's native Lora Bypass Node
 - **Performance:** ~1.15x slower due to dynamic calculations
 - **Quality:** Possibly slightly higher quality
-- Requires the node from [KohakuBlueleaf's PR #11958](https://github.com/Comfy-Org/ComfyUI/pull/11958)
 
 We auto-convert flux2 klein to INT8 on load if needed. Pre-quantized checkpoints with slightly higher quality and enabling faster loading are available here: 
 
