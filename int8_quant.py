@@ -5,6 +5,8 @@ import torch.nn.functional as F
 # Add this at the top of your file
 try:
     from .int8_fused_kernel import triton_int8_linear
+    from .int8_fused_kernel import triton_int8_linear_per_row
+    from .int8_fused_kernel import triton_quantize_rowwise
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
@@ -70,6 +72,37 @@ def int8_forward_dynamic(x: Tensor, weight: Tensor, weight_scale: float | Tensor
     # Dequantize: (res * weight_scale * x_scale)
     # Note: Creating intermediate Float tensors here is VRAM heavy
     res_scaled = res.float().mul_(weight_scale * x_scale).to(compute_dtype)
+    
+    if bias is not None:
+        res_scaled = res_scaled + bias.to(compute_dtype)
+    return res_scaled
+
+
+@torch.no_grad()
+def int8_forward_dynamic_per_row(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+    """Forward with dynamic per-token activation quantization and per-row weight quantization.
+    
+    Args:
+        x: Input activations [batch, in_features]
+        weight: INT8 weight matrix [out_features, in_features]
+        weight_scale: Per-row weight scales [out_features, 1]
+        bias: Optional bias
+        compute_dtype: Output dtype
+    """
+    # --- FAST PATH: Triton Fused Kernel (per-row) ---
+    if _TRITON_AVAILABLE and x.is_cuda:
+        return triton_int8_linear_per_row(x, weight, weight_scale, bias, compute_dtype)
+
+    # --- SLOW PATH: Standard PyTorch ---
+    x_8, x_scale = quantize_int8_axiswise(x, dim=-1)
+
+    # INT8 Matmul (Outputs Int32)
+    res = torch._int_mm(x_8, weight.T)  # [batch, out_features]
+    
+    # Dequantize with per-row weight scales
+    # res[i,j] = sum_k(x_8[i,k] * weight[j,k]) * x_scale[i] * weight_scale[j]
+    # Broadcasting: res * x_scale * weight_scale.T
+    res_scaled = res.float().mul_(x_scale).mul_(weight_scale.T).to(compute_dtype)
     
     if bias is not None:
         res_scaled = res_scaled + bias.to(compute_dtype)
@@ -313,6 +346,7 @@ if _COMFY_OPS_AVAILABLE:
                 super().__init__(*args, **kwargs)
                 self.weight_scale = None
                 self._is_quantized = False
+                self._is_per_row = False  # Track quantization granularity
                 self.compute_dtype = torch.bfloat16
                 self.lora_A = None
                 self.lora_B = None
@@ -342,9 +376,18 @@ if _COMFY_OPS_AVAILABLE:
                         Int8TensorwiseOps._is_prequantized = True # Found a quantized layer
                         
                         if isinstance(weight_scale, torch.Tensor):
-                            self.weight_scale = weight_scale.float().item() if weight_scale.numel() == 1 else weight_scale.float()
+                            if weight_scale.numel() == 1:
+                                self.weight_scale = weight_scale.float().item()
+                                self._is_per_row = False
+                            elif weight_scale.dim() == 2 and weight_scale.shape[1] == 1:
+                                self.weight_scale = weight_scale.float()
+                                self._is_per_row = True
+                            else:
+                                self.weight_scale = weight_scale.float()
+                                self._is_per_row = False
                         else:
                             self.weight_scale = float(weight_scale)
+                            self._is_per_row = False
                             
                     elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
                         # Load High-Precision
@@ -363,6 +406,7 @@ if _COMFY_OPS_AVAILABLE:
                             self.weight = nn.Parameter(q_weight.cpu(), requires_grad=False)
                             self.weight_scale = q_scale.cpu() if isinstance(q_scale, torch.Tensor) else q_scale
                             self._is_quantized = True
+                            self._is_per_row = False
                     else:
                         self._is_quantized = False
                         self.weight = nn.Parameter(weight_tensor, requires_grad=False)
@@ -450,7 +494,10 @@ if _COMFY_OPS_AVAILABLE:
                 x_2d = x.reshape(-1, x_shape[-1])
                 
                 if x_2d.shape[0] > 16:
-                    y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
+                    if self._is_per_row:
+                        y = int8_forward_dynamic_per_row(x_2d, weight, w_scale, bias, compute_dtype)
+                    else:
+                        y = int8_forward_dynamic(x_2d, weight, w_scale, bias, compute_dtype)
                 else:
                     # Small batch fallback
                     w_float = dequantize(weight, w_scale).to(x.dtype)
