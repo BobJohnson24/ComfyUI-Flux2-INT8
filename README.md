@@ -1,6 +1,6 @@
 # Flux2 INT8 Acceleration
 
-This node speeds up Flux2, Chroma, Z-Image in ComfyUI by using INT8 quantization, delivering ~2x faster inference on my 3090, but it should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
+This node speeds up Flux2, Chroma, Z-Image in ComfyUI by using INT8 quantization, delivering between 1.5~2x faster inference on my 3090 depending on the model. It should work on any NVIDIA GPU with enough INT8 TOPS. It's unlikely to be faster than proper FP8 on 40-Series and above. 
 Works with lora*, torch compile (needed to get full speedup).
 
 *LoRAs need to be applied using one of the following methods:
@@ -18,13 +18,26 @@ Works with lora*, torch compile (needed to get full speedup).
 - **Performance:** ~1.15x slower due to dynamic calculations
 - **Quality:** Possibly slightly higher quality
 
-We auto-convert flux2 klein to INT8 on load if needed. Pre-quantized checkpoints with slightly higher quality and enabling faster loading are available here: 
+Pre-quantized checkpoints are recommended for most architectures.
 
-https://huggingface.co/bertbobson/FLUX.2-klein-9B-INT8-Comfy
+**Shoutout to [vistralis](https://huggingface.co/vistralis) for these:** 
+Make sure to update the node to use them as int8 row-wise was added.
 
-https://huggingface.co/bertbobson/Chroma1-HD-INT8Tensorwise
+| Model | Link |
+|-------|------|
+| FLUX.2-klein-base-9b | [Download](https://huggingface.co/vistralis/FLUX.2-klein-base-9b-INT8-transformer) |
+| FLUX.2-klein-base-4b | [Download](https://huggingface.co/vistralis/FLUX.2-klein-base-4b-INT8-transformer) |
+| FLUX.2-klein-9b | [Download](https://huggingface.co/vistralis/FLUX.2-klein-9b-INT8-transformer) |
+| FLUX.2-klein-4b | [Download](https://huggingface.co/vistralis/FLUX.2-klein-4b-INT8-transformer) |
 
-https://huggingface.co/bertbobson/Z-Image-Turbo-INT8-Tensorwise
+**My own:**
+
+| Model | Link |
+|-------|------|
+| Chroma1-HD | [Download](https://huggingface.co/bertbobson/Chroma1-HD-INT8Tensorwise) |
+| Z-Image-Base | [Download](https://huggingface.co/bertbobson/Z-Image-Base-INT8-QUIP) |
+| Z-Image-Turbo | [Download](https://huggingface.co/bertbobson/Z-Image-Turbo-INT8-Tensorwise) |
+| Anima | [Download](https://huggingface.co/bertbobson/Anima-INT8-QUIP) |
 
 
 # Metrics:
